@@ -1,0 +1,13 @@
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Local artifacts
+/header_band_model.pkl
+
+# Data and training samples should stay local
+/data/
