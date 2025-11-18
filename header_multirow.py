@@ -153,7 +153,7 @@ def _row_score(df: pd.DataFrame, r: int) -> float:
     flip = _flip_ratio(df, r, d) if d is not None else 0.0
     mergeb = _row_merge_bonus(df, r)
     x = np.array([tr, nr, dr, uniq, empt, len_center, flip, mergeb]).reshape(1,-1)
-    z = float(x @ _ROW_COEF.T + _ROW_INTER)
+    z = float((x @ _ROW_COEF.T + _ROW_INTER).item())
     return _sigmoid(z)
 
 # ----------------- band-level scoring -----------------
@@ -274,7 +274,7 @@ def _band_score(df: pd.DataFrame, start: int, end: int, data_start: Optional[int
         except Exception:
             pass
     base = feats[:_BAND_COEF.shape[1]].reshape(1, -1)
-    z = float(base @ _BAND_COEF.T + _BAND_INTER)
+    z = float((base @ _BAND_COEF.T + _BAND_INTER).item())
     return _sigmoid(z)
 
 def detect_header_band_and_build(df: pd.DataFrame) -> Tuple[int,int,List[str]]:
@@ -315,16 +315,17 @@ def detect_header_band_and_build(df: pd.DataFrame) -> Tuple[int,int,List[str]]:
                     best = (r2, e2)
                     best_score = sc2
 
-    # 3) 비슷한 점수 내에 더 위쪽 후보가 있으면 우선
+    # 3) 점수가 비슷하다면 데이터 시작과의 거리/깊이를 기준으로 최종 선택
     if best and candidates:
-        tolerance = 0.035
-        target_start = best[0]
-        near = [
-            c for c in candidates
-            if c[0] >= best_score - tolerance and c[1] <= target_start - 2
-        ]
+        tolerance = 0.02
+        def _tie_key(item):
+            sc, st, ed = item
+            gap = max(0, data_start - (ed + 1))
+            depth = ed - st
+            return (gap, st, -depth, -sc)
+        near = [c for c in candidates if c[0] >= best_score - tolerance]
         if near:
-            near.sort(key=lambda item: (item[1], -(item[2] - item[1]), -item[0]))
+            near.sort(key=_tie_key)
             chosen = near[0]
             best = (chosen[1], chosen[2])
             best_score = chosen[0]
