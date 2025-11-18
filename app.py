@@ -358,10 +358,20 @@ class ExcelAggregator(QWidget):
             base = [(bn, self.pref_headers.get(bn, [])) for bn in self.pref_sheet_names]
             preselect = auto_match_with_headers(base, cand_name_headers, threshold=0.55)
 
-        # 3) 미리보기(기존 파일)가 있고 시트가 1개뿐이면 팝업 없이 즉시 적용
-        auto_allowed = (not force_dialog) and self._has_preview()
+        auto_allowed = not force_dialog
+        has_preview = self._has_preview()
+
+        # 3) 시트가 1개뿐이면 (미리보기 여부와 무관하게) 팝업 없이 즉시 적용
         if auto_allowed and len(sheets) == 1:
             chosen = sheets[:]
+            self._record_pref_from(path, chosen)
+            self._finalize_file_selection(path, chosen)
+            self._parse_and_preview()
+            return
+
+        # 3-1) 추천 결과가 단일 시트라면 팝업 없이 자동 적용
+        if auto_allowed and has_preview and len(preselect) == 1:
+            chosen = preselect[:]
             self._finalize_file_selection(path, chosen)
             self._parse_and_preview()
             return
@@ -394,6 +404,8 @@ class ExcelAggregator(QWidget):
     def _parse_and_preview(self):
         if not self.file_paths:
             self.table.setModel(None)
+            self.parsed.clear()
+            self.combined = None
             return
         self.progress.setVisible(True)
         self.progress.setValue(0)
