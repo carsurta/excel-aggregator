@@ -32,7 +32,7 @@ META_MAP = {
 META_COLS_KR = list(META_MAP.values())
 
 class _FileRow(QWidget):
-    def __init__(self, parent, path: str, on_remove, on_choose):
+    def __init__(self, parent, path: str, on_remove, on_choose, on_header):
         super().__init__(parent)
         self.path = path
         from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QLabel, QSizePolicy
@@ -61,6 +61,11 @@ class _FileRow(QWidget):
         self.btn_sheet.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_sheet.clicked.connect(lambda: on_choose(self.path, True))
         hl.addWidget(self.btn_sheet)
+
+        self.btn_header = QPushButton("헤더 확인/조정")
+        self.btn_header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_header.clicked.connect(lambda: on_header(self.path))
+        hl.addWidget(self.btn_header)
 
 # ============== Qt Model for pandas ==================
 class PandasModel(QAbstractTableModel):
@@ -127,6 +132,7 @@ class ExcelAggregator(QWidget):
         # 저장된 헤더 시그니처(사용자가 확정한 헤더 행/데이터)
         self.saved_header_signature = None
         self.saved_header_band = None
+        self.sheet_header_cache: Dict[Tuple[str, str], Tuple[Tuple[str, ...], Tuple[int, int], List[str]]] = {}
 
         # ---- Layout: vertical splitter (resizable list + preview) ----
         root = QVBoxLayout(self)
@@ -309,7 +315,7 @@ class ExcelAggregator(QWidget):
             if w and getattr(w, "path", "") == path:
                 return it  # 이미 존재
         it = QListWidgetItem(self.list)
-        w = _FileRow(self, path, self._remove_file, self._open_sheet_chooser_for)
+        w = _FileRow(self, path, self._remove_file, self._open_sheet_chooser_for, self._open_header_adjust_for)
         it.setSizeHint(w.sizeHint())
         self.list.addItem(it)
         self.list.setItemWidget(it, w)
@@ -321,10 +327,45 @@ class ExcelAggregator(QWidget):
         for p in self.file_paths:
             self._add_list_item(p)
 
+    def _open_header_adjust_for(self, path: str):
+        sheets = self.file_sheets.get(path) or []
+        if not sheets:
+            try:
+                sheets = list_sheet_names(path)
+            except Exception as e:
+                traceback.print_exc()
+                QMessageBox.critical(self, "시트 조회 오류", f"{os.path.basename(path)} 시트 목록을 불러올 수 없습니다.\n{e}")
+                return
+        sheet = None
+        if len(sheets) == 1:
+            sheet = sheets[0]
+        else:
+            dlg = SingleSheetDialog(self, path, sheets)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            sheet = dlg.selected_sheet()
+        if not sheet:
+            return
+        try:
+            raw = load_sheet_merge_aware(path, sheet)
+            st, ed, headers = detect_header_band_and_build(raw)
+            # sheet 캐시가 있으면 초기 밴드/시그니처로 활용
+            cached = self.sheet_header_cache.get((path, sheet))
+            if cached:
+                _, band, _ = cached
+                st, ed = band
+            st, ed, headers = self._resolve_header_band(raw, path, sheet, st, ed, force_dialog=True)
+            # 헤더가 갱신되었으니 전체 미리보기 재계산
+            self._parse_and_preview()
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "헤더 보정 오류", f"{os.path.basename(path)} / {sheet}\n{e}")
+
     def _remove_file(self, path: str):
         self.file_paths = [p for p in self.file_paths if p != path]
         if path in self.file_sheets:
             del self.file_sheets[path]
+        self.sheet_header_cache = {k: v for k, v in self.sheet_header_cache.items() if k[0] != path}
         self._refresh_all_items()
         self._parse_and_preview()
 
@@ -384,37 +425,72 @@ class ExcelAggregator(QWidget):
                     best_sig = sig
         return best_band, best_sig, best_score
 
-    def _resolve_header_band(self, df, path: str, sheet: str, guess_start: int, guess_end: int) -> tuple[int, int, List[str]]:
-        saved_sig = self.saved_header_signature
-        saved_band = self.saved_header_band
-        # 1) If 기존 헤더가 있고 같은 데이터면 팝업 없이 사용
-        if saved_sig:
-            if saved_band and saved_band[1] < len(df):
-                sig_same_band = self._header_signature(df, saved_band[0], saved_band[1])
-                if sig_same_band == saved_sig:
-                    headers = build_headers_from_band(df, saved_band[0], saved_band[1])
-                    return saved_band[0], saved_band[1], headers
+    def _resolve_header_band(
+        self,
+        df,
+        path: str,
+        sheet: str,
+        guess_start: int,
+        guess_end: int,
+        force_dialog: bool = False,
+    ) -> tuple[int, int, List[str]]:
+        key = (path, sheet)
+        saved_sheet = self.sheet_header_cache.get(key)
+        saved_sig_global = self.saved_header_signature
+        saved_band_global = self.saved_header_band
+
+        # 1) sheet별 캐시 우선 적용
+        if not force_dialog and saved_sheet:
+            sig_sheet, band_sheet, _ = saved_sheet
+            if band_sheet[1] < len(df):
+                sig_same = self._header_signature(df, band_sheet[0], band_sheet[1])
+                if sig_same == sig_sheet:
+                    headers = build_headers_from_band(df, band_sheet[0], band_sheet[1])
+                    return band_sheet[0], band_sheet[1], headers
+
+        # 2) 글로벌 시그니처 자동 적용 (첫 파일 기준)
+        if not force_dialog and saved_sig_global:
+            if saved_band_global and saved_band_global[1] < len(df):
+                sig_same_band = self._header_signature(df, saved_band_global[0], saved_band_global[1])
+                if sig_same_band == saved_sig_global:
+                    headers = build_headers_from_band(df, saved_band_global[0], saved_band_global[1])
+                    return saved_band_global[0], saved_band_global[1], headers
             sig_guess = self._header_signature(df, guess_start, guess_end)
-            if sig_guess == saved_sig:
+            if sig_guess == saved_sig_global:
                 self.saved_header_band = (guess_start, guess_end)
                 headers = build_headers_from_band(df, guess_start, guess_end)
                 return guess_start, guess_end, headers
 
-        # 2) 헤더 선택창을 띄워야 하는 경우: (a) 첫 파일, (b) 저장된 헤더와 데이터가 다른 경우
+        # 3) 사전 추정 밴드 결정
         pre_start, pre_end = guess_start, guess_end
-        if saved_sig:
-            best_band, best_sig, _ = self._find_best_band(df, saved_sig)
+        target_sig = None
+        if saved_sheet:
+            target_sig, band_sheet, _ = saved_sheet
+            pre_start, pre_end = band_sheet
+        elif saved_sig_global:
+            target_sig = saved_sig_global
+
+        if target_sig:
+            best_band, _, _ = self._find_best_band(df, target_sig)
             if best_band:
                 pre_start, pre_end = best_band
+
+        # 4) 보정 UI
         dlg = HeaderAdjustDialog(self, df, pre_start, pre_end)
         accepted = dlg.exec() == QDialog.DialogCode.Accepted
         if accepted:
             start, end = dlg.selected_band()
         else:
             start, end = pre_start, pre_end
+
         headers = build_headers_from_band(df, start, end)
+        sig_final = self._header_signature(df, start, end)
+
+        # sheet별 캐시 저장
+        self.sheet_header_cache[key] = (sig_final, (start, end), headers)
+        # 글로벌 기본 시그니처는 최초 또는 사용자가 수동 확정한 경우만 갱신
         if self.saved_header_signature is None or accepted:
-            self.saved_header_signature = self._header_signature(df, start, end)
+            self.saved_header_signature = sig_final
             self.saved_header_band = (start, end)
         return start, end, headers
 
@@ -507,6 +583,7 @@ class ExcelAggregator(QWidget):
         self.combined = None
         self.saved_header_signature = None
         self.saved_header_band = None
+        self.sheet_header_cache = {}
         self.pref_sheet_names = []
         self.pref_headers = {}
         self.table.setModel(None)
@@ -518,6 +595,7 @@ class ExcelAggregator(QWidget):
             self.combined = None
             self.saved_header_signature = None
             self.saved_header_band = None
+            self.sheet_header_cache = {}
             return
         self.progress.setVisible(True)
         self.progress.setValue(0)
@@ -591,6 +669,7 @@ class ExcelAggregator(QWidget):
         # 시그니처 초기화 후 재파싱(보정 UI를 다시 띄움)
         self.saved_header_signature = None
         self.saved_header_band = None
+        self.sheet_header_cache = {}
         self._parse_and_preview()
 
     def _filtered_for_preview(self):
@@ -863,6 +942,30 @@ class SheetChooser(QDialog):
             QApplication.alert(self, 0)
         except Exception:
             pass
+
+class SingleSheetDialog(QDialog):
+    def __init__(self, parent, file_path: str, sheets: list[str]):
+        super().__init__(parent)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowTitle(f"헤더 확인/조정 – {os.path.basename(file_path)}")
+        self.resize(360, 400)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("헤더를 조정할 시트를 선택하세요."))
+        self.listw = QListWidget(self)
+        self.listw.addItems(sheets)
+        self.listw.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        layout.addWidget(self.listw, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        if sheets:
+            self.listw.setCurrentRow(0)
+
+    def selected_sheet(self) -> Optional[str]:
+        it = self.listw.currentItem()
+        return it.text() if it else None
 
 def main():
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
