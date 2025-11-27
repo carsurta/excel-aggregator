@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # app.py – Excel Aggregator (Drag & Drop) – FINAL UI/Features
 from __future__ import annotations
 import sys, os, traceback, importlib
@@ -7,7 +8,7 @@ from typing import List, Dict, Optional, Tuple
 def _pd():
     return importlib.import_module("pandas")
 
-from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QTimer
+from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QTimer, QItemSelection, QItemSelectionModel
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QListWidget,
     QFileDialog, QHBoxLayout, QMessageBox, QTableView, QProgressBar, QCheckBox,
@@ -103,7 +104,6 @@ class PandasModel(QAbstractTableModel):
 class ParsedSheet:
     file_path: str
     sheet_name: str
-    header_row: int
     columns: List[str]
     data: "pandas.DataFrame"
 
@@ -126,6 +126,7 @@ class ExcelAggregator(QWidget):
         self.file_sheets: Dict[str, List[str]] = {}
         # 저장된 헤더 시그니처(사용자가 확정한 헤더 행/데이터)
         self.saved_header_signature = None
+        self.saved_header_band = None
 
         # ---- Layout: vertical splitter (resizable list + preview) ----
         root = QVBoxLayout(self)
@@ -179,7 +180,6 @@ class ExcelAggregator(QWidget):
         self.chk_meta.stateChanged.connect(self._refresh_preview)
         bottom_bar.addWidget(self.chk_meta)
         bottom_bar.addWidget(self.lbl_meta)
-        bottom_bar.addStretch(1)
 
         self.chk_log = QCheckBox()
         self.chk_log.setChecked(False)
@@ -189,7 +189,12 @@ class ExcelAggregator(QWidget):
         self.lbl_log.mousePressEvent = lambda e: self.chk_log.toggle()
         bottom_bar.addWidget(self.chk_log)
         bottom_bar.addWidget(self.lbl_log)
+
         bottom_bar.addStretch(1)
+
+        self.btn_reheader = QPushButton("헤더 다시 선택")
+        self.btn_reheader.clicked.connect(self._reselect_header)
+        bottom_bar.addWidget(self.btn_reheader)
 
         self.btn_save = QPushButton("출력 저장…")
         self.btn_save.clicked.connect(self._save_output)
@@ -343,20 +348,74 @@ class ExcelAggregator(QWidget):
             sig.append("|".join(parts))
         return tuple(sig)
 
-    def _resolve_header_band(self, df, path: str, sheet: str, guess_start: int, guess_end: int) -> tuple[int, int, List[str]]:
-        sig_guess = self._header_signature(df, guess_start, guess_end)
-        if self.saved_header_signature and sig_guess == self.saved_header_signature:
-            headers = build_headers_from_band(df, guess_start, guess_end)
-            return guess_start, guess_end, headers
+    def _header_similarity(self, sig_a: Tuple[str, ...], sig_b: Tuple[str, ...]) -> float:
+        if not sig_a or not sig_b:
+            return 0.0
+        def to_tokens(sig):
+            toks = []
+            for row in sig:
+                for part in str(row).lower().split("|"):
+                    part = part.strip()
+                    if part:
+                        toks.append(part)
+            return set(toks)
+        ta, tb = to_tokens(sig_a), to_tokens(sig_b)
+        if not ta or not tb:
+            return 0.0
+        inter = len(ta & tb)
+        union = len(ta | tb)
+        return inter / union if union else 0.0
 
-        dlg = HeaderAdjustDialog(self, df, guess_start, guess_end)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            start, end = guess_start, guess_end
-        else:
+    def _find_best_band(self, df, target_sig: Tuple[str, ...], top_rows: int = 30, max_height: int = 5):
+        best_band = None
+        best_sig = ()
+        best_score = -1.0
+        rows = min(len(df), top_rows)
+        target_h = max(1, len(target_sig) if target_sig else 1)
+        min_h = max(1, target_h - 1)
+        max_h = max(min_h, min(max_height, target_h + 1))
+        for s in range(rows):
+            for e in range(s + min_h - 1, min(rows, s + max_h)):
+                sig = self._header_signature(df, s, e)
+                score = self._header_similarity(target_sig, sig)
+                if score > best_score:
+                    best_score = score
+                    best_band = (s, e)
+                    best_sig = sig
+        return best_band, best_sig, best_score
+
+    def _resolve_header_band(self, df, path: str, sheet: str, guess_start: int, guess_end: int) -> tuple[int, int, List[str]]:
+        saved_sig = self.saved_header_signature
+        saved_band = self.saved_header_band
+        # 1) If 기존 헤더가 있고 같은 데이터면 팝업 없이 사용
+        if saved_sig:
+            if saved_band and saved_band[1] < len(df):
+                sig_same_band = self._header_signature(df, saved_band[0], saved_band[1])
+                if sig_same_band == saved_sig:
+                    headers = build_headers_from_band(df, saved_band[0], saved_band[1])
+                    return saved_band[0], saved_band[1], headers
+            sig_guess = self._header_signature(df, guess_start, guess_end)
+            if sig_guess == saved_sig:
+                self.saved_header_band = (guess_start, guess_end)
+                headers = build_headers_from_band(df, guess_start, guess_end)
+                return guess_start, guess_end, headers
+
+        # 2) 헤더 선택창을 띄워야 하는 경우: (a) 첫 파일, (b) 저장된 헤더와 데이터가 다른 경우
+        pre_start, pre_end = guess_start, guess_end
+        if saved_sig:
+            best_band, best_sig, _ = self._find_best_band(df, saved_sig)
+            if best_band:
+                pre_start, pre_end = best_band
+        dlg = HeaderAdjustDialog(self, df, pre_start, pre_end)
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if accepted:
             start, end = dlg.selected_band()
+        else:
+            start, end = pre_start, pre_end
         headers = build_headers_from_band(df, start, end)
-        if self.saved_header_signature is None:
+        if self.saved_header_signature is None or accepted:
             self.saved_header_signature = self._header_signature(df, start, end)
+            self.saved_header_band = (start, end)
         return start, end, headers
 
     def _record_pref_from(self, path: str, sheets: list[str]):
@@ -447,6 +506,9 @@ class ExcelAggregator(QWidget):
         self.parsed.clear()
         self.combined = None
         self.saved_header_signature = None
+        self.saved_header_band = None
+        self.pref_sheet_names = []
+        self.pref_headers = {}
         self.table.setModel(None)
 
     def _parse_and_preview(self):
@@ -454,6 +516,8 @@ class ExcelAggregator(QWidget):
             self.table.setModel(None)
             self.parsed.clear()
             self.combined = None
+            self.saved_header_signature = None
+            self.saved_header_band = None
             return
         self.progress.setVisible(True)
         self.progress.setValue(0)
@@ -476,7 +540,7 @@ class ExcelAggregator(QWidget):
                     data = data.dropna(how='all')
                     for c in data.columns:
                         data[c] = data[c].apply(lambda x: str(x).strip() if (x is not None and str(x).strip() != "nan") else x)
-                    parsed.append(ParsedSheet(file_path=p, sheet_name=sh, header_row=start, columns=headers, data=data))
+                    parsed.append(ParsedSheet(file_path=p, sheet_name=sh, columns=headers, data=data))
             except Exception as e:
                 traceback.print_exc()
                 QMessageBox.critical(self, "읽기 오류", f"{os.path.basename(p)} 처리 중 오류\n{e}")
@@ -514,6 +578,20 @@ class ExcelAggregator(QWidget):
         self.combined = combined
         self.progress.setVisible(False)
         self._refresh_preview()
+
+    def _reselect_header(self):
+        selected = self.list.selectedItems()
+        if not selected:
+            # 선택이 없고 파일이 1개뿐이면 자동 선택
+            if self.list.count() == 1:
+                self.list.setCurrentRow(0)
+            else:
+                QMessageBox.information(self, "알림", "헤더를 다시 선택할 파일을 목록에서 선택하세요.")
+                return
+        # 시그니처 초기화 후 재파싱(보정 UI를 다시 띄움)
+        self.saved_header_signature = None
+        self.saved_header_band = None
+        self._parse_and_preview()
 
     def _filtered_for_preview(self):
         if self.combined is None:
@@ -621,6 +699,10 @@ class HeaderAdjustDialog(QDialog):
         self.resize(900, 500)
         layout = QVBoxLayout(self)
 
+        guide = QLabel("원하는 영역에서 헤더로 쓸 행을 드래그해 선택하고, 위/아래 버튼으로 크기를 조정하세요. 선택된 행만 헤더로 적용됩니다.")
+        guide.setStyleSheet("color:#444;padding:4px 0;")
+        layout.addWidget(guide)
+
         top_rows = max(10, min(60, len(df_raw)))
         df_prev = df_raw.head(top_rows).copy()
         try:
@@ -633,6 +715,9 @@ class HeaderAdjustDialog(QDialog):
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
+        self.table.setStyleSheet(
+            "QTableView::item:selected{background-color:#ffe6b3;color:#000;border:1px solid #ff8c00;}"
+        )
         layout.addWidget(self.table, 1)
 
         ctl = QHBoxLayout()
@@ -655,20 +740,68 @@ class HeaderAdjustDialog(QDialog):
         ctl.addWidget(btns)
         layout.addLayout(ctl)
 
-        self.spin_start.valueChanged.connect(self._sync_selection)
-        self.spin_end.valueChanged.connect(self._sync_selection)
+        self._sync_guard = False
+        sel_model = self.table.selectionModel()
+        sel_model.selectionChanged.connect(lambda *_: self._selection_changed())
+        self.spin_start.valueChanged.connect(lambda _=None: self._sync_selection("start"))
+        self.spin_end.valueChanged.connect(lambda _=None: self._sync_selection("end"))
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         self._sync_selection()
 
-    def _sync_selection(self):
-        s = min(self.spin_start.value(), self.spin_end.value()) - 1
-        e = max(self.spin_start.value(), self.spin_end.value()) - 1
+    def _sync_selection(self, source=None):
+        s_val = self.spin_start.value()
+        e_val = self.spin_end.value()
+        if source == "start" and s_val > e_val:
+            e_val = s_val
+            self.spin_end.blockSignals(True)
+            self.spin_end.setValue(e_val)
+            self.spin_end.blockSignals(False)
+        elif source == "end" and e_val < s_val:
+            s_val = e_val
+            self.spin_start.blockSignals(True)
+            self.spin_start.setValue(s_val)
+            self.spin_start.blockSignals(False)
+        s = s_val - 1
+        e = e_val - 1
         sel = self.table.selectionModel()
         if sel:
+            self._sync_guard = True
             sel.clearSelection()
-        for r in range(s, e+1):
-            self.table.selectRow(r)
+            model = self.table.model()
+            if model and model.rowCount() > 0:
+                max_row = model.rowCount() - 1
+                max_col = max(0, model.columnCount() - 1)
+                s_clamped = max(0, min(s, max_row))
+                e_clamped = max(0, min(e, max_row))
+                top_left = model.index(s_clamped, 0)
+                bottom_right = model.index(e_clamped, max_col)
+                sel_range = QItemSelection(top_left, bottom_right)
+                sel.select(sel_range, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            self._sync_guard = False
+        try:
+            self.table.scrollTo(self.table.model().index(s, 0))
+        except Exception:
+            pass
+        self.table.viewport().update()
+
+    def _selection_changed(self):
+        if getattr(self, "_sync_guard", False):
+            return
+        sel = self.table.selectionModel()
+        if not sel:
+            return
+        rows = [i.row() for i in sel.selectedRows()]
+        if not rows:
+            return
+        s, e = min(rows), max(rows)
+        # block signals to avoid recursion
+        self.spin_start.blockSignals(True)
+        self.spin_end.blockSignals(True)
+        self.spin_start.setValue(s+1)
+        self.spin_end.setValue(e+1)
+        self.spin_start.blockSignals(False)
+        self.spin_end.blockSignals(False)
 
     def selected_band(self) -> tuple[int, int]:
         s = min(self.spin_start.value(), self.spin_end.value()) - 1
