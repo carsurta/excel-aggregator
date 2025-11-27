@@ -38,6 +38,7 @@ except Exception:
 
 from header_multirow import load_sheet_merge_aware, HEADER_SCAN_ROWS
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,9 @@ DATA_DIR = BASE_DIR / "data"
 LABEL_CSV = DATA_DIR / "header_labels.csv"
 OUT_PATH = BASE_DIR / "header_band_model.pkl"
 
+NEGATIVE_FACTOR = 8           # keep at most this multiple of negatives vs positives
+POSITIVE_AUG_MULT = 3         # total copies of positive samples with noise
+POSITIVE_AUG_NOISE = 0.02
 
 def build_dataset() -> tuple[np.ndarray, np.ndarray, list[tuple[str, str, int, int]]]:
     if not LABEL_CSV.exists():
@@ -95,7 +99,40 @@ def build_dataset() -> tuple[np.ndarray, np.ndarray, list[tuple[str, str, int, i
 
     X = np.array(X, dtype=float)
     y = np.array(y, dtype=int)
+
     rng = np.random.default_rng(42)
+
+    pos_idx = np.where(y == 1)[0]
+    neg_idx = np.where(y == 0)[0]
+    if len(pos_idx) == 0:
+        return np.empty((0, 0), float), np.empty((0,), int), meta
+
+    max_neg = min(len(neg_idx), NEGATIVE_FACTOR * len(pos_idx))
+    if len(neg_idx) > max_neg:
+        keep_neg = rng.choice(neg_idx, size=max_neg, replace=False)
+    else:
+        keep_neg = neg_idx
+    keep_idx = np.concatenate([pos_idx, keep_neg])
+    X = X[keep_idx]
+    y = y[keep_idx]
+    meta = [meta[i] for i in keep_idx]
+
+    if POSITIVE_AUG_MULT > 1 and len(pos_idx) > 0:
+        pos_mask = y == 1
+        base_pos = X[pos_mask]
+        base_meta = [meta[i] for i, lbl in enumerate(y) if lbl == 1]
+        aug_X = [X]
+        aug_y = [y]
+        aug_meta = meta[:]
+        for _ in range(POSITIVE_AUG_MULT - 1):
+            noise = rng.normal(0, POSITIVE_AUG_NOISE, size=base_pos.shape)
+            aug_X.append(base_pos + noise)
+            aug_y.append(np.ones(len(base_pos), dtype=int))
+            aug_meta.extend(base_meta)
+        X = np.vstack(aug_X)
+        y = np.concatenate(aug_y)
+        meta = aug_meta
+
     perm = rng.permutation(len(X))
     X = X[perm]
     y = y[perm]
@@ -114,20 +151,56 @@ def main():
         print("y 라벨이 한 종류 뿐입니다. header_start_1based / header_end_1based 값을 다시 확인하세요.")
         return
 
+    pos_count = int((y == 1).sum())
+    neg_count = int((y == 0).sum())
+    scale_pos_weight = max(1.0, neg_count / max(1, pos_count))
+
+    has_valid = len(y) >= 20 and neg_count > 0 and pos_count > 1
+    if has_valid:
+        X_train, X_valid, y_train, y_valid = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+    else:
+        X_train, y_train = X, y
+        X_valid = y_valid = None
+
     if HAS_LGBM:
         print("Using LightGBM (supervised).")
-        dtrain = lgb.Dataset(X, label=y)
+        dtrain = lgb.Dataset(X_train, label=y_train)
+        valid_sets = [dtrain]
+        valid_names = ["train"]
+        if X_valid is not None:
+            dvalid = lgb.Dataset(X_valid, label=y_valid)
+            valid_sets.append(dvalid)
+            valid_names.append("valid")
         params = dict(
             objective="binary",
             boosting="gbdt",
-            learning_rate=0.1,
-            num_leaves=31,
-            feature_fraction=0.9,
-            bagging_fraction=0.8,
+            learning_rate=0.05,
+            num_leaves=16,
+            max_depth=6,
+            min_data_in_leaf=5,
+            min_split_gain=0.01,
+            feature_fraction=0.85,
+            bagging_fraction=0.7,
             bagging_freq=1,
+            lambda_l1=0.1,
+            lambda_l2=1.0,
+            scale_pos_weight=scale_pos_weight,
             verbose=-1,
         )
-        model = lgb.train(params, dtrain, num_boost_round=400)
+        callbacks = []
+        if X_valid is not None:
+            callbacks.append(lgb.early_stopping(80, verbose=False))
+        callbacks.append(lgb.log_evaluation(period=0))
+        model = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=1200,
+            valid_sets=valid_sets,
+            valid_names=valid_names,
+            callbacks=callbacks,
+        )
         train_scores = np.ravel(model.predict(X))
         impl = ("lightgbm", model)
     else:
@@ -136,6 +209,7 @@ def main():
             max_depth=6,
             learning_rate=0.1,
             max_iter=400,
+            class_weight="balanced",
         )
         model.fit(X, y)
         proba = model.predict_proba(X)
@@ -148,10 +222,8 @@ def main():
     preds = (np.ravel(train_scores) >= 0.5).astype(int)
     acc = accuracy_score(y, preds)
     prec, recall, f1, _ = precision_recall_fscore_support(y, preds, average="binary", zero_division=0)
-    pos = int(y.sum())
-    neg = int((y == 0).sum())
     print(f"모델 저장 완료: {OUT_PATH}")
-    print(f"총 샘플 수: {len(y)} (positive={pos}, negative={neg})")
+    print(f"총 샘플 수: {len(y)} (positive={pos_count}, negative={neg_count}, scale_pos_weight={scale_pos_weight:.2f})")
     print(f"학습 지표 — acc: {acc:.3f}, precision: {prec:.3f}, recall: {recall:.3f}, f1: {f1:.3f}")
 
 

@@ -16,7 +16,6 @@ BASE_DIR = Path(__file__).resolve().parent
 _BAND_MODEL_PATH = BASE_DIR / "header_band_model.pkl"
 _BAND_MODEL: Optional[tuple[str, object]] = None
 _BAND_MODEL_FAILED = False
-
 _token_cleaner = re.compile(r"\s+|\n|\r")
 _nonword = re.compile(r"[^\w가-힣%\-/.,()]+", re.UNICODE)
 
@@ -207,7 +206,9 @@ def _band_core_features(df: pd.DataFrame, start: int, end: int) -> np.ndarray:
     toks_nz = [t for t in toks if t != ""]
     uniq = len(set(toks_nz))/max(1, len(toks_nz))
     empt = 1 - (len(toks_nz)/max(1, len(toks)))
-    return np.array([avg_row, min_row, depth_norm, flip, diversity, merges, uniq, empt], dtype=float)
+    features = [avg_row, min_row, depth_norm, flip, diversity, merges, uniq, empt]
+
+    return np.array(features, dtype=float)
 
 def _data_follow_ratio(df: pd.DataFrame, end: int, window: int = 5) -> float:
     total = 0
@@ -236,6 +237,8 @@ def band_features(df: pd.DataFrame, start: int, end: int, data_start: Optional[i
 _BAND_COEF = np.array([[ 2.6, 0.6, 1.2, 1.4, 1.3, 1.0, 0.4, -0.9 ]], dtype=float)
 _BAND_INTER = np.array([-1.1], dtype=float)
 
+
+
 def _load_band_model() -> Optional[tuple[str, object]]:
     global _BAND_MODEL, _BAND_MODEL_FAILED
     if _BAND_MODEL is not None:
@@ -258,6 +261,10 @@ def _load_band_model() -> Optional[tuple[str, object]]:
 
 def _band_score(df: pd.DataFrame, start: int, end: int, data_start: Optional[int] = None) -> float:
     feats = band_features(df, start, end, data_start=data_start)
+    base = feats[:_BAND_COEF.shape[1]].reshape(1, -1)
+    z = float((base @ _BAND_COEF.T + _BAND_INTER).item())
+    logistic_score = _sigmoid(z)
+
     impl = _load_band_model()
     if impl is not None:
         model_type, model = impl
@@ -265,22 +272,22 @@ def _band_score(df: pd.DataFrame, start: int, end: int, data_start: Optional[int
         try:
             if model_type == "lightgbm":
                 proba = model.predict(x)
-                score = float(np.ravel(proba)[0])
-                return min(max(score, 0.0), 1.0)
+                ml_score = float(np.ravel(proba)[0])
             elif model_type == "sk_hgb":
                 proba = model.predict_proba(x)
-                score = float(proba[0, 1])
-                return min(max(score, 0.0), 1.0)
+                ml_score = float(proba[0, 1])
+            else:
+                ml_score = None
         except Exception:
-            pass
-    base = feats[:_BAND_COEF.shape[1]].reshape(1, -1)
-    z = float((base @ _BAND_COEF.T + _BAND_INTER).item())
-    return _sigmoid(z)
+            ml_score = None
+        if ml_score is not None:
+            return min(max(ml_score, 0.0), 1.0)
+    return logistic_score
 
 def detect_header_band_and_build(df: pd.DataFrame) -> Tuple[int,int,List[str]]:
     """
-    헤더 밴드(연속 1~5행)를 찾아 (start, end, headers)를 반환.
-    headers는 위→아래를 ' | '로 합친 다단 컬럼명.
+    다단 헤더 밴드를 찾아 (start, end, headers)를 반환한다.
+    headers는 위->아래를 ' | '로 합친 다단 컬럼명이다.
     """
     scan = min(HEADER_SCAN_ROWS, len(df))
     data_start = detect_data_start_strict(df)
@@ -294,44 +301,40 @@ def detect_header_band_and_build(df: pd.DataFrame) -> Tuple[int,int,List[str]]:
         for k in range(1, min(MAX_HEADER_DEPTH, search_limit - r) + 1):
             end = r + k - 1
             sc = _band_score(df, r, end, data_start=data_start)
-            # 너무 아래에 있으면 약한 패널티
             sc -= 0.02 * max(0, r - 6)
             if end >= data_start:
                 sc -= 0.05 * (end - data_start + 1)
-            candidates.append((sc, r, end))
-            if sc > best_score:
-                best = (r, end); best_score = sc
+            row_avg = float(np.mean([_row_score(df, rr) for rr in range(r, end+1)]))
+            combined = 0.7 * sc + 0.3 * row_avg
+            candidates.append((combined, r, end, sc, row_avg))
+            if combined > best_score:
+                best = (r, end); best_score = combined
 
-    # 2) 1행 vs 2행 밴드 경합 시, 2행이 충분히 근접하면 2행을 우선(다단 보정)
+    # 2) 1행 vs 2행 밴드 경합 조정
     if best:
         r0, e0 = best
         k0 = e0 - r0 + 1
         if k0 == 1:
-            # 같은 시작 r0에 대해 k=2가 존재하면 비교
-            alt = [(sc, r, e) for (sc, r, e) in candidates if r == r0 and (e - r + 1) == 2]
+            alt = [(sc_raw, r, e) for (_, r, e, sc_raw, _) in candidates if r == r0 and (e - r + 1) == 2]
             if alt:
                 sc2, r2, e2 = max(alt, key=lambda x: x[0])
-                if sc2 >= best_score * 0.97:  # 2행 밴드가 97% 이상 근접하면 다단으로 선택
-                    best = (r2, e2)
-                    best_score = sc2
+                if sc2 >= best_score * 0.97:
+                    best = (r2, e2); best_score = sc2
 
-    # 3) 점수가 비슷하다면 데이터 시작과의 거리/깊이를 기준으로 최종 선택
+    # 3) 비슷한 점수의 더 위쪽 후보 우선
     if best and candidates:
         tolerance = 0.02
-        def _tie_key(item):
-            sc, st, ed = item
-            gap = max(0, data_start - (ed + 1))
-            depth = ed - st
-            return (gap, st, -depth, -sc)
-        near = [c for c in candidates if c[0] >= best_score - tolerance]
+        target_start = best[0]
+        near = [
+            c for c in candidates
+            if c[0] >= best_score - tolerance and c[1] <= target_start - 2
+        ]
         if near:
-            near.sort(key=_tie_key)
+            near.sort(key=lambda item: (item[1], -(item[2] - item[1]), -item[0]))
             chosen = near[0]
-            best = (chosen[1], chosen[2])
-            best_score = chosen[0]
+            best = (chosen[1], chosen[2]); best_score = chosen[0]
 
     if best is None:
-        # fallback: 1행 헤더
         headers = [(_norm(v) or f"컬럼{c+1}") for c, v in enumerate(df.iloc[0, :].tolist())]
         out=[]; used={}
         for s in headers:
@@ -341,7 +344,7 @@ def detect_header_band_and_build(df: pd.DataFrame) -> Tuple[int,int,List[str]]:
 
     start, end = best
 
-    # 3) 다단 헤더 합성 (빈칸은 건너뛰고 상·하위만 체인)
+    # 4) 다단 헤더 합성
     bands = [df.iloc[r, :].apply(_norm).tolist() for r in range(start, end+1)]
     combined = []
     for c in range(len(bands[0])):
@@ -349,13 +352,26 @@ def detect_header_band_and_build(df: pd.DataFrame) -> Tuple[int,int,List[str]]:
         name = " | ".join(parts).strip() if parts else ""
         combined.append(name or f"컬럼{c+1}")
 
-    # 4) 중복 방지
     out=[]; used={}
     for s in combined:
         k = used.get(s,0); used[s]=k+1
         out.append(s if k==0 else f"{s}_{k+1}")
     return (start, end, out)
 
+
 def build_multirow_headers(df: pd.DataFrame, _hint: int) -> List[str]:
     _, _, headers = detect_header_band_and_build(df)
     return headers
+
+def build_headers_from_band(df: pd.DataFrame, start: int, end: int) -> List[str]:
+    bands = [df.iloc[r, :].apply(_norm).tolist() for r in range(start, end+1)]
+    combined = []
+    for c in range(len(bands[0])):
+        parts = [bands[r][c] for r in range(len(bands)) if bands[r][c] != ""]
+        name = " | ".join(parts).strip() if parts else ""
+        combined.append(name or f"컬럼{c+1}")
+    out=[]; used={}
+    for s in combined:
+        k = used.get(s,0); used[s]=k+1
+        out.append(s if k==0 else f"{s}_{k+1}")
+    return out

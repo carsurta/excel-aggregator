@@ -11,10 +11,14 @@ from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QListWidget,
     QFileDialog, QHBoxLayout, QMessageBox, QTableView, QProgressBar, QCheckBox,
-    QSplitter, QListWidgetItem, QDialog, QDialogButtonBox, QListWidget
+    QSplitter, QListWidgetItem, QDialog, QDialogButtonBox, QListWidget, QSpinBox
 )
 
-from header_multirow import load_sheet_merge_aware, detect_header_band_and_build
+from header_multirow import (
+    load_sheet_merge_aware,
+    detect_header_band_and_build,
+    build_headers_from_band,
+)
 from sheet_match import list_sheet_names, auto_match_with_headers
 from validators import compute_violations
 
@@ -22,7 +26,6 @@ from validators import compute_violations
 META_MAP = {
     "file": "출처 파일명",
     "sheet": "출처 시트명",
-    "header_row": "헤더 행 번호(원본)",
     "violations": "유효성 점검 메모",
 }
 META_COLS_KR = list(META_MAP.values())
@@ -121,6 +124,8 @@ class ExcelAggregator(QWidget):
         self.pref_sheet_names: List[str] = []  # used for auto-preselect on later files
         # selected sheets per file
         self.file_sheets: Dict[str, List[str]] = {}
+        # 저장된 헤더 시그니처(사용자가 확정한 헤더 행/데이터)
+        self.saved_header_signature = None
 
         # ---- Layout: vertical splitter (resizable list + preview) ----
         root = QVBoxLayout(self)
@@ -166,7 +171,6 @@ class ExcelAggregator(QWidget):
             "출력 결과물에 다음 정보를 표기합니다:\n"
             f"• {META_MAP['file']}: 취합의 출처가 된 원본 엑셀 파일 이름 (예: 자료제출_부서A.xlsx)\n"
             f"• {META_MAP['sheet']}: 해당 데이터가 있었던 원본 시트 이름 (예: 제출본, 입력데이터)\n"
-            f"• {META_MAP['header_row']}: 원본 시트에서 컬럼명으로 판단된 헤더 행 번호 (예: 2)\n"
             f"• {META_MAP['violations']}: 전화/이메일 형식 오류, 빈값, 중복 등 간단한 유효성 점검 메모 (예: [연락처:전화형식] [이메일:형식] [번호:중복])\n\n"
             "체크를 해제하면 위 정보는 출력 파일에 포함되지 않으며 미리보기에서도 숨겨집니다."
         )
@@ -175,6 +179,16 @@ class ExcelAggregator(QWidget):
         self.chk_meta.stateChanged.connect(self._refresh_preview)
         bottom_bar.addWidget(self.chk_meta)
         bottom_bar.addWidget(self.lbl_meta)
+        bottom_bar.addStretch(1)
+
+        self.chk_log = QCheckBox()
+        self.chk_log.setChecked(False)
+        self.lbl_log = QLabel("로그 저장")
+        self.lbl_log.setStyleSheet("padding-left:4px;")
+        self.lbl_log.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_log.mousePressEvent = lambda e: self.chk_log.toggle()
+        bottom_bar.addWidget(self.chk_log)
+        bottom_bar.addWidget(self.lbl_log)
         bottom_bar.addStretch(1)
 
         self.btn_save = QPushButton("출력 저장…")
@@ -312,6 +326,39 @@ class ExcelAggregator(QWidget):
     def _has_preview(self) -> bool:
         return bool(self.parsed)
 
+    def _header_signature(self, df, start: int, end: int):
+        sig: List[str] = []
+        for r in range(start, end + 1):
+            try:
+                row = df.iloc[r, :].tolist()
+            except Exception:
+                continue
+            parts = []
+            for v in row:
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    parts.append(s)
+            sig.append("|".join(parts))
+        return tuple(sig)
+
+    def _resolve_header_band(self, df, path: str, sheet: str, guess_start: int, guess_end: int) -> tuple[int, int, List[str]]:
+        sig_guess = self._header_signature(df, guess_start, guess_end)
+        if self.saved_header_signature and sig_guess == self.saved_header_signature:
+            headers = build_headers_from_band(df, guess_start, guess_end)
+            return guess_start, guess_end, headers
+
+        dlg = HeaderAdjustDialog(self, df, guess_start, guess_end)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            start, end = guess_start, guess_end
+        else:
+            start, end = dlg.selected_band()
+        headers = build_headers_from_band(df, start, end)
+        if self.saved_header_signature is None:
+            self.saved_header_signature = self._header_signature(df, start, end)
+        return start, end, headers
+
     def _record_pref_from(self, path: str, sheets: list[str]):
         if self.file_paths or self.pref_sheet_names or not sheets:
             return
@@ -399,6 +446,7 @@ class ExcelAggregator(QWidget):
         self.list.clear()
         self.parsed.clear()
         self.combined = None
+        self.saved_header_signature = None
         self.table.setModel(None)
 
     def _parse_and_preview(self):
@@ -418,6 +466,7 @@ class ExcelAggregator(QWidget):
                 for sh in sheets:
                     raw = load_sheet_merge_aware(p, sh)
                     start, end, headers = detect_header_band_and_build(raw)
+                    start, end, headers = self._resolve_header_band(raw, p, sh, start, end)
                     pd = _pd()
                     data = raw.iloc[end+1:, :].copy()
                     data.columns = headers[: data.shape[1]]
@@ -456,7 +505,6 @@ class ExcelAggregator(QWidget):
             df = df[all_cols]
             df[META_MAP["file"]] = os.path.basename(ps.file_path)
             df[META_MAP["sheet"]] = str(ps.sheet_name)
-            df[META_MAP["header_row"]] = ps.header_row
             frames.append(df)
 
         combined = _pd().concat(frames, ignore_index=True)
@@ -550,17 +598,82 @@ class ExcelAggregator(QWidget):
 
             wb.save(path)
 
-            log_path = os.path.join(os.path.dirname(path), "취합_로그.csv")
-            _pd().DataFrame([
-                {"file": os.path.basename(p.file_path), "sheet": p.sheet_name, "header_row": p.header_row}
-                for p in self.parsed
-            ]).to_csv(log_path, index=False, encoding="utf-8-sig")
+            log_path = None
+            if self.chk_log.isChecked():
+                log_path = os.path.join(os.path.dirname(path), "취합_로그.csv")
+                _pd().DataFrame([
+                    {"file": os.path.basename(p.file_path), "sheet": p.sheet_name}
+                    for p in self.parsed
+                ]).to_csv(log_path, index=False, encoding="utf-8-sig")
 
-            QMessageBox.information(self, "저장됨", f"출력: {path}\n로그: {log_path}")
+            msg = f"출력: {path}"
+            if log_path:
+                msg += f"\n로그: {log_path}"
+            QMessageBox.information(self, "저장됨", msg)
         except Exception as err:
             traceback.print_exc()
             QMessageBox.critical(self, "저장 오류", str(err))
             
+class HeaderAdjustDialog(QDialog):
+    def __init__(self, parent, df_raw, guess_start: int, guess_end: int):
+        super().__init__(parent)
+        self.setWindowTitle("헤더 보정")
+        self.resize(900, 500)
+        layout = QVBoxLayout(self)
+
+        top_rows = max(10, min(60, len(df_raw)))
+        df_prev = df_raw.head(top_rows).copy()
+        try:
+            df_prev = df_prev.fillna("")
+        except Exception:
+            pass
+
+        self.model = PandasModel(df_prev)
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.table, 1)
+
+        ctl = QHBoxLayout()
+        ctl.addWidget(QLabel("헤더 시작 행"))
+        self.spin_start = QSpinBox()
+        self.spin_start.setMinimum(1)
+        self.spin_start.setMaximum(top_rows)
+        self.spin_start.setValue(min(max(1, guess_start+1), top_rows))
+        ctl.addWidget(self.spin_start)
+
+        ctl.addWidget(QLabel("헤더 끝 행"))
+        self.spin_end = QSpinBox()
+        self.spin_end.setMinimum(1)
+        self.spin_end.setMaximum(top_rows)
+        self.spin_end.setValue(min(max(1, guess_end+1), top_rows))
+        ctl.addWidget(self.spin_end)
+
+        ctl.addStretch(1)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        ctl.addWidget(btns)
+        layout.addLayout(ctl)
+
+        self.spin_start.valueChanged.connect(self._sync_selection)
+        self.spin_end.valueChanged.connect(self._sync_selection)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        self._sync_selection()
+
+    def _sync_selection(self):
+        s = min(self.spin_start.value(), self.spin_end.value()) - 1
+        e = max(self.spin_start.value(), self.spin_end.value()) - 1
+        sel = self.table.selectionModel()
+        if sel:
+            sel.clearSelection()
+        for r in range(s, e+1):
+            self.table.selectRow(r)
+
+    def selected_band(self) -> tuple[int, int]:
+        s = min(self.spin_start.value(), self.spin_end.value()) - 1
+        e = max(self.spin_start.value(), self.spin_end.value()) - 1
+        return s, e
 
 
 class SheetChooser(QDialog):
